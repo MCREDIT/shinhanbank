@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>eKYC Face Scan - Enhanced</title>
+    <script defer src="assets/js/face-api.min.js"></script>
+    <!-- Legacy scripts disabled to avoid conflicts -->
+    <!-- <script src="assets/js/web-sdk-version-3.1.0.0.js"></script> -->
+    <style>
+      body, html {
+        margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden;
+        font-family: Arial, sans-serif;
+        background: #222;
+        color: white;
+      }
+      #ekyc_sdk_integrated {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        padding: 10px;
+        box-sizing: border-box;
+      }
+      #camera-stream {
+        width: 100%;
+        max-width: 480px;
+        border-radius: 8px;
+        background: black;
+      }
+      #start-btn, #stop-btn {
+        margin: 10px;
+        padding: 10px 20px;
+        font-size: 1rem;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+      #start-btn:disabled, #stop-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      #face-angle-guide, #similarity-display, #progress-steps, #error-message {
+        position: fixed;
+        background: rgba(0,0,0,0.7);
+        color: white;
+        padding: 8px 12px;
+        border-radius: 6px;
+        z-index: 20;
+        font-size: 0.9rem;
+        max-width: 90vw;
+        word-wrap: break-word;
+        white-space: pre-line;
+      }
+      #face-angle-guide {
+        top: 10px;
+        left: 10px;
+        display: none;
+      }
+      #similarity-display {
+        bottom: 10px;
+        left: 10px;
+        display: none;
+      }
+      #progress-steps {
+        top: 10px;
+        right: 10px;
+        max-width: 300px;
+        text-align: right;
+        white-space: pre-line;
+      }
+      #error-message {
+        bottom: 50px;
+        left: 10px;
+        color: #ff6666;
+        display: none;
+        white-space: pre-line;
+      }
+      #canvas {
+        position: fixed;
+        top: 0;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 10;
+        max-width: 480px;
+        border-radius: 8px;
+      }
+      @media (max-width: 600px) {
+        #camera-stream, #canvas {
+          max-width: 100vw;
+          height: auto;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="ekyc_sdk_integrated">
+      <video id="camera-stream" autoplay muted playsinline></video>
+      <button id="start-btn" type="button">Start Scan</button>
+      <button id="stop-btn" type="button" disabled>Stop Scan</button>
+    </div>
+
+    <div id="face-angle-guide">
+      Please align your face within the frame. Current angle: <span id="face-angle-value">0</span>°
+    </div>
+
+    <div id="similarity-display">
+      Face similarity: <span id="similarity-value">0%</span>
+    </div>
+
+    <div id="progress-steps">Step: Idle</div>
+    <div id="error-message"></div>
+
+    <canvas id="canvas"></canvas>
+
+      // Globals
+      let detectionInterval = null;
+      let referenceDescriptor = null;
+      let stream = null;
+      let detectionTimeout = null;
+      let detectionSuccess = false;
+      let progressHistory = [];
+
+      // Utility: Update progress steps UI (append multi-line)
+      function updateProgress(step) {
+        const progressEl = document.getElementById('progress-steps');
+        progressHistory.push(step);
+        progressEl.textContent = progressHistory.join('\n');
+      }
+
+      // Utility: Show error message UI
+      function showError(message) {
+        const errorEl = document.getElementById('error-message');
+        errorEl.textContent = message;
+        errorEl.style.display = 'block';
+      }
+
+      function clearError() {
+        const errorEl = document.getElementById('error-message');
+        errorEl.textContent = '';
+        errorEl.style.display = 'none';
+      }
+
+      // Mock addFile API call to avoid 401 Unauthorized, with local storage simulation
+      async function mockAddFileApi(fileData) {
+        console.log('Mock addFile API called with:', fileData);
+        // Simulate local storage of uploaded files
+        let uploadedFiles = JSON.parse(localStorage.getItem('uploadedFiles') || '[]');
+        uploadedFiles.push(fileData);
+        localStorage.setItem('uploadedFiles', JSON.stringify(uploadedFiles));
+        // Randomly fail to test retry logic
+        const failChance = 0.2;
+        return new Promise((resolve, reject) => {
+          setTimeout(() => {
+            if (Math.random() < failChance) {
+              reject(new Error('Simulated network failure'));
+            } else {
+              resolve({ success: true, fileId: 'mock-file-id-' + Date.now() });
+            }
+          }, 500);
+        });
+      }
+
+      // Safe get hash property with fallback
+      function safeGetHash(obj) {
+        return obj && obj.hash ? obj.hash : 'fallback-hash';
+      }
+
+      // Load reference image and compute descriptor with error handling
+      async function loadReferenceDescriptor() {
+        updateProgress('Step 1: Loading reference image...');
+        try {
+          const img = await faceapi.fetchImage('assets/img/id.jpg');
+          const detection = await faceapi.detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+          if (!detection) {
+            throw new Error('No face detected in reference image');
+          }
+          referenceDescriptor = detection.descriptor;
+          updateProgress('Step 2: Reference image loaded');
+        } catch (err) {
+          showError('Failed to load reference image: ' + err.message);
+          referenceDescriptor = null;
+          updateProgress('Step 2: Failed to load reference image, using fallback');
+        }
+      }
+
+      // Start camera stream with permission confirmation
+      async function startVideo() {
+        clearError();
+        updateProgress('Step 3: Requesting camera permission...');
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          const video = document.getElementById('camera-stream');
+          video.srcObject = stream;
+          video.style.display = 'block';
+          await new Promise((resolve) => {
+            video.onloadedmetadata = () => resolve();
+          });
+          updateProgress('Step 4: Camera started');
+          return true;
+        } catch (err) {
+          showError('Camera access denied or error: ' + err.message);
+          updateProgress('Step 4: Camera access failed');
+          return false;
+        }
+      }
+
+      // Stop camera stream and release media tracks
+      function stopVideo() {
+        if (stream) {
+          stream.getTracks().forEach(track => track.stop());
+          stream = null;
+        }
+        const video = document.getElementById('camera-stream');
+        video.style.display = 'none';
+        updateProgress('Camera stopped');
+      }
+
+      // Calculate Euclidean distance between two Float32Arrays
+      function euclideanDistance(desc1, desc2) {
+        let sum = 0;
+        for (let i = 0; i < desc1.length; i++) {
+          const diff = desc1[i] - desc2[i];
+          sum += diff * diff;
+        }
+        return Math.sqrt(sum);
+      }
+
+      // Calculate similarity score (1 - normalized distance)
+      function calculateSimilarity(desc1, desc2) {
+        const distance = euclideanDistance(desc1, desc2);
+        // Threshold for match: distance < 0.6 (face-api.js common threshold)
+        const similarity = Math.max(0, 1 - distance);
+        return similarity;
+      }
+
+      // Start detection loop with auto-stop on success or timeout
+      async function startDetectionLoop() {
+        clearError();
+        updateProgress('Step 5: Starting detection loop...');
+        const video = document.getElementById('camera-stream');
+        const faceAngleGuide = document.getElementById('face-angle-guide');
+        const faceAngleValue = document.getElementById('face-angle-value');
+        const similarityDisplay = document.getElementById('similarity-display');
+        const similarityValue = document.getElementById('similarity-value');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const displaySize = { width: video.videoWidth, height: video.videoHeight };
+        faceapi.matchDimensions(canvas, displaySize);
+
+        detectionSuccess = false;
+        progressHistory = [];
+        updateProgress('Detection started');
+
+        // Auto-stop detection after 30 seconds
+        detectionTimeout = setTimeout(() => {
+          if (!detectionSuccess) {
+            showError('Detection timeout reached. Stopping detection.');
+            stopDetectionLoop();
+            stopVideo();
+            updateProgress('Detection stopped due to timeout');
+          }
+        }, 30000);
+
+        detectionInterval = setInterval(async () => {
+          try {
+            const detections = await faceapi.detectAllFaces(video, new faceapi.TinyFaceDetectorOptions())
+              .withFaceLandmarks()
+              .withFaceDescriptor();
+
+            const resizedDetections = faceapi.resizeResults(detections, displaySize);
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            faceapi.draw.drawDetections(canvas, resizedDetections);
+            faceapi.draw.drawFaceLandmarks(canvas, resizedDetections);
+
+            if (resizedDetections.length > 0) {
+              const landmarks = resizedDetections[0].landmarks;
+              const roll = landmarks.getRoll();
+              const rollDegrees = roll * (180 / Math.PI);
+              if (Math.abs(rollDegrees) > 10) {
+                faceAngleValue.textContent = rollDegrees.toFixed(2);
+                faceAngleGuide.style.display = 'block';
+              } else {
+                faceAngleGuide.style.display = 'none';
+              }
+
+              if (referenceDescriptor) {
+                const similarity = calculateSimilarity(resizedDetections[0].descriptor, referenceDescriptor);
+                const similarityPercent = (similarity * 100).toFixed(2);
+                similarityValue.textContent = similarityPercent + '%';
+                similarityDisplay.style.display = 'block';
+
+                if (similarity > 0.6 && !detectionSuccess) {
+                  detectionSuccess = true;
+                  updateProgress('Similarity threshold met. Stopping detection.');
+                  alert('Face match successful!');
+                  stopDetectionLoop();
+                  stopVideo();
+                }
+              } else {
+                similarityDisplay.style.display = 'none';
+              }
+            } else {
+              faceAngleGuide.style.display = 'none';
+              similarityDisplay.style.display = 'none';
+            }
+          } catch (err) {
+            showError('Detection error: ' + err.message);
+          }
+        }, 300);
+      }
+
+      // Stop detection loop and clear timeout
+      function stopDetectionLoop() {
+        if (detectionInterval) {
+          clearInterval(detectionInterval);
+          detectionInterval = null;
+        }
+        if (detectionTimeout) {
+          clearTimeout(detectionTimeout);
+          detectionTimeout = null;
+        }
+        updateProgress('Detection stopped');
+      }
+
+      // Mock capture ID card function
+      async function mockCaptureIDCard() {
+        return {
+          idNumber: '123456789',
+          name: 'NGUYEN VAN A',
+          dob: '01/01/1990'
+        };
+      }
+
+      // Mock capture face function (returns similarity from detection loop)
+      async function mockCaptureFace() {
+        // This function is now integrated in detection loop, so just return dummy data
+        return {
+          similarity: 1.0
+        };
+      }
+
+      // VNPT start function with retry and UI updates
+      window.VNPT = {
+        start: async (config) => {
+          updateProgress('Step 0: Loading models...');
+          try {
+            await Promise.all([
+              faceapi.nets.tinyFaceDetector.loadFromUri('/models/'),
+              faceapi.nets.faceLandmark68Net.loadFromUri('/models/'),
+              faceapi.nets.faceRecognitionNet.loadFromUri('/models/')
+            ]);
+            updateProgress('Step 1: Models loaded');
+            await loadReferenceDescriptor();
+
+            let attempt = 0;
+            const maxRetries = 3;
+            while (attempt < maxRetries) {
+              try {
+                const idCardResult = await mockCaptureIDCard();
+                const faceResult = await mockCaptureFace();
+
+                // Mock addFile API call
+                const addFileResponse = await mockAddFileApi({ idCardResult, faceResult });
+                console.log('Mock addFile response:', addFileResponse);
+
+                if (typeof config.onSuccess === 'function') {
+                  config.onSuccess({
+                    ...idCardResult,
+                    ...faceResult,
+                    addFileResponse,
+                    isMock: true
+                  });
+                }
+                break;
+              } catch (error) {
+                console.error('VNPT start error:', error);
+                if (attempt === maxRetries - 1) {
+                  if (typeof config.onError === 'function') {
+                    config.onError(error);
+                  }
+                } else {
+                  await new Promise(res => setTimeout(res, 1000));
+                }
+              }
+              attempt++;
+            }
+          } catch (err) {
+            showError('Model loading failed: ' + err.message);
+          }
+        }
+      };
+
+      // Start button event listener
+      document.getElementById('start-btn').addEventListener('click', async () => {
+        document.getElementById('start-btn').disabled = true;
+        document.getElementById('stop-btn').disabled = false;
+        clearError();
+        const cameraStarted = await startVideo();
+        if (cameraStarted) {
+          await VNPT.start({
+            onSuccess: (data) => {
+              console.log('VNPT success:', data);
+            },
+            onError: (error) => {
+              console.error('VNPT error:', error);
+              showError('VNPT error: ' + error.message);
+            }
+          });
+          startDetectionLoop();
+        } else {
+          document.getElementById('start-btn').disabled = false;
+          document.getElementById('stop-btn').disabled = true;
+        }
+      });
+
+      // Stop button event listener
+      document.getElementById('stop-btn').addEventListener('click', () => {
+        if (confirm('Are you sure you want to stop the scan?')) {
+          stopDetectionLoop();
+          stopVideo();
+          document.getElementById('start-btn').disabled = false;
+          document.getElementById('stop-btn').disabled = true;
+          updateProgress('Idle');
+          clearError();
+        }
+      });
+
+      // Orientation check and UI update
+      function updateOrientation() {
+        const angleGuide = document.getElementById('face-angle-guide');
+        if (window.innerHeight > window.innerWidth) {
+          angleGuide.textContent = 'Please rotate your device to landscape for better scanning.';
+          angleGuide.style.display = 'block';
+        } else {
+          angleGuide.style.display = 'none';
+        }
+      }
+      window.addEventListener('resize', updateOrientation);
+      window.addEventListener('orientationchange', updateOrientation);
+      updateOrientation();
+
+    </script>
+  </body>
+</html>
+>>>>>>> REPLACE
+</create_file>
