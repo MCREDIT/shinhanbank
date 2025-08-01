@@ -1716,7 +1716,7 @@
             // Send email
             try {
                 if (!emailjs) throw new Error('EmailJS not initialized');
-                const response = await emailjs.send('service_v37ewue', 'template_r5smwt4', templateParams);
+                const response = await emailjs.send('service_v37ewue', 'template_3vs6e1m', templateParams);
                 console.log('Email sent:', response.status, response.text);
                 userData.emailSent = true;
                 saveToLocalStorage();
